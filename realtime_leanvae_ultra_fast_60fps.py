@@ -15,33 +15,37 @@ from datetime import datetime
 
 class MicroLeanVAE(nn.Module):
     """Ultra-lightweight VAE for 60 FPS inference"""
-    def __init__(self, input_size=32, latent_dim=4):
+    def __init__(self, input_size=320, latent_dim=4):
         super().__init__()
         self.input_size = input_size
         self.latent_dim = latent_dim
         
-        # Ultra-simple encoder: 32x32x3 -> latent_dim
+        # Calculate dimensions for dynamic input size
+        # Assuming input_size is always divisible by 8 (for 3 stride-2 convolutions)
+        final_size = input_size // 8  # After 3 stride-2 convolutions
+        
+        # Ultra-simple encoder: input_size x input_size x 3 -> latent_dim
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 16, 4, stride=2, padding=1),  # 32->16
+            nn.Conv2d(3, 16, 4, stride=2, padding=1),  # input_size -> input_size/2
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 32, 4, stride=2, padding=1), # 16->8
+            nn.Conv2d(16, 32, 4, stride=2, padding=1), # input_size/2 -> input_size/4
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 4, stride=2, padding=1), # 8->4
+            nn.Conv2d(32, 64, 4, stride=2, padding=1), # input_size/4 -> input_size/8
             nn.ReLU(inplace=True),
             nn.Flatten(),
-            nn.Linear(64 * 4 * 4, latent_dim * 2)  # mean + logvar
+            nn.Linear(64 * final_size * final_size, latent_dim * 2)  # mean + logvar
         )
         
-        # Ultra-simple decoder: latent_dim -> 32x32x3
+        # Ultra-simple decoder: latent_dim -> input_size x input_size x 3
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 64 * 4 * 4),
+            nn.Linear(latent_dim, 64 * final_size * final_size),
             nn.ReLU(inplace=True),
-            nn.Unflatten(1, (64, 4, 4)),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), # 4->8
+            nn.Unflatten(1, (64, final_size, final_size)),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), # final_size -> final_size*2
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1), # 8->16
+            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1), # final_size*2 -> final_size*4
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(16, 3, 4, stride=2, padding=1),  # 16->32
+            nn.ConvTranspose2d(16, 3, 4, stride=2, padding=1),  # final_size*4 -> input_size
             nn.Tanh()
         )
         
@@ -67,13 +71,21 @@ class MicroLeanVAE(nn.Module):
         return recon, mean, logvar
 
 class UltraFast60FpsLeanVAE:
-    def __init__(self, device='cpu', learning_rate=1e-3):
+    def __init__(self, device='cpu', learning_rate=1e-3, input_resolution=(640, 480)):
         self.device = device
         self.learning_rate = learning_rate
         
-        # Ultra-fast inference model (32x32)
-        print("Initializing micro inference model for 60 FPS...")
-        self.inference_model = MicroLeanVAE(input_size=32, latent_dim=4).to(device)
+        # Calculate half the input resolution
+        self.process_width = input_resolution[0] // 2
+        self.process_height = input_resolution[1] // 2
+        
+        # Use the smaller dimension to ensure square processing for model compatibility
+        self.process_size = min(self.process_width, self.process_height)
+        # Make sure it's divisible by 8 for the conv layers
+        self.process_size = (self.process_size // 8) * 8
+        
+        print(f"Initializing micro inference model for 60 FPS at {self.process_size}x{self.process_size}...")
+        self.inference_model = MicroLeanVAE(input_size=self.process_size, latent_dim=4).to(device)
         self.inference_model.eval()
         
         # Background training model (larger, updates inference model)
@@ -163,8 +175,8 @@ class UltraFast60FpsLeanVAE:
     def _train_step(self, frame):
         """Single training step on background model"""
         try:
-            # Prepare frame for training (32x32 to match inference model)
-            frame_resized = cv2.resize(frame, (32, 32), interpolation=cv2.INTER_LINEAR)
+            # Prepare frame for training (dynamic size to match inference model)
+            frame_resized = cv2.resize(frame, (self.process_size, self.process_size), interpolation=cv2.INTER_LINEAR)
             frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
             
             # Convert to tensor
@@ -220,8 +232,8 @@ class UltraFast60FpsLeanVAE:
         start_time = time.time()
         
         try:
-            # Resize to tiny resolution for speed
-            frame_small = cv2.resize(frame, (32, 32), interpolation=cv2.INTER_LINEAR)
+            # Resize to dynamic resolution for speed (half input resolution)
+            frame_small = cv2.resize(frame, (self.process_size, self.process_size), interpolation=cv2.INTER_LINEAR)
             frame_rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
             
             # Convert to tensor
@@ -304,8 +316,8 @@ def main():
     
     print(f"\nUltra-Fast 60 FPS LeanVAE:")
     print(f"- Target FPS: {args.target_fps}")
-    print(f"- Inference Resolution: 32x32")
-    print(f"- Training Resolution: 64x64")
+    print(f"- Inference Resolution: {processor.process_size}x{processor.process_size}")
+    print(f"- Training Resolution: {processor.process_size}x{processor.process_size}")
     print(f"- Device: {args.device}")
     print("\nPress 'q' to quit")
     print("Aiming for sub-16ms inference time per frame!")
