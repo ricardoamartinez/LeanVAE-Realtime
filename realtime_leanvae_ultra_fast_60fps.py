@@ -15,7 +15,7 @@ from datetime import datetime
 
 class MicroLeanVAE(nn.Module):
     """Ultra-lightweight VAE for 60 FPS inference with improved color representation"""
-    def __init__(self, input_size=320, latent_dim=8):
+    def __init__(self, input_size=320, latent_dim=6):
         super().__init__()
         self.input_size = input_size
         self.latent_dim = latent_dim
@@ -24,29 +24,29 @@ class MicroLeanVAE(nn.Module):
         # Assuming input_size is always divisible by 8 (for 3 stride-2 convolutions)
         final_size = input_size // 8  # After 3 stride-2 convolutions
         
-        # Enhanced encoder with more channels for better color representation
+        # Enhanced encoder for better color representation
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 4, stride=2, padding=1),  # input_size -> input_size/2
+            nn.Conv2d(3, 24, 4, stride=2, padding=1),  # input_size -> input_size/2
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(32, 64, 4, stride=2, padding=1), # input_size/2 -> input_size/4
+            nn.Conv2d(24, 48, 4, stride=2, padding=1), # input_size/2 -> input_size/4
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, 4, stride=2, padding=1), # input_size/4 -> input_size/8
+            nn.Conv2d(48, 96, 4, stride=2, padding=1), # input_size/4 -> input_size/8
             nn.LeakyReLU(0.2, inplace=True),
             nn.Flatten(),
-            nn.Linear(128 * final_size * final_size, latent_dim * 2)  # mean + logvar
+            nn.Linear(96 * final_size * final_size, latent_dim * 2)  # mean + logvar
         )
         
-        # Enhanced decoder with more channels for better color reconstruction
+        # Enhanced decoder for better color reconstruction
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 128 * final_size * final_size),
+            nn.Linear(latent_dim, 96 * final_size * final_size),
             nn.ReLU(inplace=True),
-            nn.Unflatten(1, (128, final_size, final_size)),
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1), # final_size -> final_size*2
+            nn.Unflatten(1, (96, final_size, final_size)),
+            nn.ConvTranspose2d(96, 48, 4, stride=2, padding=1), # final_size -> final_size*2
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), # final_size*2 -> final_size*4
+            nn.ConvTranspose2d(48, 24, 4, stride=2, padding=1), # final_size*2 -> final_size*4
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 3, 4, stride=2, padding=1),  # final_size*4 -> input_size
-            nn.Sigmoid()  # Use sigmoid for better color range
+            nn.ConvTranspose2d(24, 3, 4, stride=2, padding=1),  # final_size*4 -> input_size
+            nn.Sigmoid()  # Better for color range [0, 1]
         )
         
     def encode(self, x):
@@ -85,7 +85,7 @@ class UltraFast60FpsLeanVAE:
         self.process_size = (self.process_size // 8) * 8
         
         print(f"Initializing micro inference model for 60 FPS at {self.process_size}x{self.process_size}...")
-        self.inference_model = MicroLeanVAE(input_size=self.process_size, latent_dim=8).to(device)  # More latent dims for color
+        self.inference_model = MicroLeanVAE(input_size=self.process_size, latent_dim=6).to(device)  # Better latent space for colors
         self.inference_model.eval()
         
         # Background training model (larger, updates inference model)
@@ -93,8 +93,8 @@ class UltraFast60FpsLeanVAE:
         self.training_model = self._initialize_training_model().to(device)
         self.training_model.train()
         
-        # Optimizers - moderate learning rate to avoid mode collapse
-        self.inference_optimizer = optim.Adam(self.inference_model.parameters(), lr=learning_rate * 1.5)
+        # Optimizers
+        self.inference_optimizer = optim.Adam(self.inference_model.parameters(), lr=learning_rate)
         self.training_optimizer = optim.AdamW(self.training_model.parameters(), lr=learning_rate/10, weight_decay=1e-4)
         
         # Threading for background training
@@ -190,15 +190,19 @@ class UltraFast60FpsLeanVAE:
             # Forward pass
             reconstructed, mean, logvar = self.inference_model(frame_tensor)
             
-            # Compute loss with proper numerical stability
-            recon_loss = self.mse_loss(reconstructed, frame_tensor)
+            # Compute loss with color-preserving perceptual approach
+            # L1 loss preserves colors better than MSE
+            recon_loss = torch.mean(torch.abs(reconstructed - frame_tensor))
             
-            # Clamp logvar to prevent numerical instability
-            logvar = torch.clamp(logvar, min=-10, max=10)
+            # Enhanced color saturation loss - ensure all RGB channels are preserved equally
+            rgb_mean = torch.mean(reconstructed, dim=1, keepdim=True)  # Grayscale version
+            saturation_loss = -torch.mean(torch.abs(reconstructed - rgb_mean))  # Negative to maximize difference from grayscale
+            
+            # Specific green channel preservation - ensure green is not left out
+            green_preservation = torch.mean(torch.abs(reconstructed[:,1:2] - rgb_mean))  # Encourage green channel diversity
+            
             kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
-            kl_loss = torch.clamp(kl_loss, min=0, max=1000)  # Prevent extreme KL values
-            
-            total_loss = recon_loss + 0.00001 * kl_loss  # Even smaller KL weight for stability
+            total_loss = recon_loss + 0.0001 * kl_loss + 0.5 * saturation_loss + 0.3 * green_preservation
             
             # Backward pass
             total_loss.backward()
