@@ -65,10 +65,10 @@ class OnlineLearningLeanVAE:
         self.last_capture_time = 0
         self.last_training_time = 0
         self.last_stats_time = time.time()
-        self.training_interval = 1.0 / 8  # Train at most 8 FPS
+        self.training_interval = 1.0 / 60  # Train at most 60 FPS
         
-        # Resolution for speed
-        self.process_resolution = 128
+        # Resolution for speed - much smaller for 60fps
+        self.process_resolution = 64
         
         # Loss function
         self.mse_loss = nn.MSELoss()
@@ -76,16 +76,16 @@ class OnlineLearningLeanVAE:
         
     def _initialize_untrained_model(self):
         """Initialize an untrained LeanVAE model with random weights"""
-        # Create args for LeanVAE initialization
+        # Create args for LeanVAE initialization - reduced by half for speed
         args = argparse.Namespace(
-            embedding_dim=512,
-            latent_dim=4,
-            ista_iter_num=2,
-            ista_layer_num=2,
-            l_dim=128,
-            h_dim=384,
-            sep_num_layer=2,
-            fusion_num_layer=4,
+            embedding_dim=256,  # Half of 512
+            latent_dim=4,       # Keep small for compression
+            ista_iter_num=1,    # Half of 2
+            ista_layer_num=1,   # Half of 2
+            l_dim=64,           # Half of 128
+            h_dim=192,          # Half of 384
+            sep_num_layer=1,    # Half of 2
+            fusion_num_layer=2, # Half of 4
             use_tile_inference=False,
             chunksize_enc=9,
             chunksize_dec=5
