@@ -114,6 +114,12 @@ class UltraFast60FpsLeanVAE:
             'training_updates': 0
         }
         
+        # Motion stability tracking
+        self.previous_frame = None
+        self.previous_reconstruction = None
+        self.motion_history = deque(maxlen=10)
+        self.loss_history = deque(maxlen=20)
+        
         # Loss function
         self.mse_loss = nn.MSELoss()
         
@@ -173,7 +179,7 @@ class UltraFast60FpsLeanVAE:
                 print(f"Background training error: {e}")
     
     def _train_step(self, frame):
-        """Single training step on background model"""
+        """Motion-aware training step with temporal consistency"""
         try:
             # Prepare frame for training (dynamic size to match inference model)
             frame_resized = cv2.resize(frame, (self.process_size, self.process_size), interpolation=cv2.INTER_LINEAR)
@@ -183,16 +189,39 @@ class UltraFast60FpsLeanVAE:
             frame_tensor = torch.tensor(frame_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
             frame_tensor = frame_tensor.to(self.device)
             
-            # Train the inference model directly instead of complex background model
+            # Detect motion level for adaptive training
+            motion_level = 0.0
+            if self.previous_frame is not None:
+                frame_diff = cv2.absdiff(frame_resized, self.previous_frame)
+                motion_level = np.mean(frame_diff) / 255.0
+                self.motion_history.append(motion_level)
+            
+            # Store current frame for next iteration
+            self.previous_frame = frame_resized.copy()
+            
+            # Train the inference model directly with motion-aware approach
             self.inference_model.train()
             self.inference_optimizer.zero_grad()
             
             # Forward pass
             reconstructed, mean, logvar = self.inference_model(frame_tensor)
             
-            # Compute loss with color-preserving perceptual approach
-            # L1 loss preserves colors better than MSE
+            # Base reconstruction loss - L1 preserves colors better than MSE
             recon_loss = torch.mean(torch.abs(reconstructed - frame_tensor))
+            
+            # Temporal consistency loss - crucial for motion stability
+            temporal_loss = torch.tensor(0.0, device=self.device)
+            if self.previous_reconstruction is not None:
+                # Compare current reconstruction with previous one
+                prev_recon_tensor = torch.tensor(self.previous_reconstruction).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+                prev_recon_tensor = prev_recon_tensor.to(self.device)
+                
+                # Temporal consistency: reconstructions should change smoothly
+                temporal_loss = torch.mean(torch.abs(reconstructed - prev_recon_tensor))
+                
+                # Scale temporal loss based on motion - more motion allows more change
+                motion_factor = min(motion_level * 2, 1.0)  # Cap at 1.0
+                temporal_loss = temporal_loss * (1.0 - motion_factor)
             
             # Enhanced color saturation loss - ensure all RGB channels are preserved equally
             rgb_mean = torch.mean(reconstructed, dim=1, keepdim=True)  # Grayscale version
@@ -201,13 +230,41 @@ class UltraFast60FpsLeanVAE:
             # Specific green channel preservation - ensure green is not left out
             green_preservation = torch.mean(torch.abs(reconstructed[:,1:2] - rgb_mean))  # Encourage green channel diversity
             
+            # KL loss with motion-adaptive weight
             kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
-            total_loss = recon_loss + 0.0001 * kl_loss + 0.5 * saturation_loss + 0.3 * green_preservation
+            kl_weight = 0.0001 * (1.0 + motion_level)  # Increase KL weight during motion
             
-            # Backward pass
+            # Motion-adaptive total loss
+            temporal_weight = 0.3 if temporal_loss > 0 else 0.0
+            total_loss = (recon_loss + 
+                         kl_weight * kl_loss + 
+                         0.5 * saturation_loss + 
+                         0.3 * green_preservation + 
+                         temporal_weight * temporal_loss)
+            
+            # Store loss for monitoring
+            self.loss_history.append(total_loss.item())
+            
+            # Motion-adaptive learning rate
+            base_lr = self.learning_rate
+            if len(self.motion_history) > 0:
+                avg_motion = np.mean(list(self.motion_history))
+                # Reduce learning rate during high motion to improve stability
+                lr_factor = max(0.5, 1.0 - avg_motion * 2.0)
+                for param_group in self.inference_optimizer.param_groups:
+                    param_group['lr'] = base_lr * lr_factor
+            
+            # Backward pass with motion-adaptive gradient clipping
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.inference_model.parameters(), max_norm=1.0)
+            clip_norm = 0.5 if motion_level > 0.1 else 1.0  # Stricter clipping during motion
+            torch.nn.utils.clip_grad_norm_(self.inference_model.parameters(), max_norm=clip_norm)
             self.inference_optimizer.step()
+            
+            # Store current reconstruction for next temporal consistency check
+            with torch.no_grad():
+                recon_np = reconstructed.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                recon_np = np.nan_to_num(recon_np, nan=0.0, posinf=1.0, neginf=0.0)
+                self.previous_reconstruction = (recon_np * 255).clip(0, 255).astype(np.uint8)
             
             self.inference_model.eval()  # Back to eval mode
             self.stats['training_updates'] += 1
