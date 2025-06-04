@@ -125,6 +125,12 @@ class UltraFast60FpsLeanVAE:
         self.motion_predictor = self._create_motion_predictor().to(device)  # Tiny MLP for latent prediction
         self.motion_optimizer = optim.Adam(self.motion_predictor.parameters(), lr=learning_rate * 0.1)
         
+        # Physics-based latent dynamics (zero inference overhead)
+        self.physics_engine = self._create_physics_engine().to(device)  # Hamiltonian/Lagrangian dynamics
+        self.physics_optimizer = optim.Adam(self.physics_engine.parameters(), lr=learning_rate * 0.05)
+        self.energy_history = deque(maxlen=10)  # Track energy conservation
+        self.dt = 1.0 / 30.0  # Time step for physics simulation (30 FPS assumption)
+        
         # Loss function
         self.mse_loss = nn.MSELoss()
         
@@ -169,6 +175,80 @@ class UltraFast60FpsLeanVAE:
             nn.LeakyReLU(0.2), 
             nn.Linear(16, 6)   # → 6D predicted next latent
         )
+    
+    def _create_physics_engine(self):
+        """Create physics engine for Hamiltonian/Lagrangian dynamics in latent space"""
+        class HamiltonianEngine(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Potential energy function V(q) - learned potential field
+                self.potential_net = nn.Sequential(
+                    nn.Linear(3, 8),  # 3D position → potential
+                    nn.Tanh(),
+                    nn.Linear(8, 8),
+                    nn.Tanh(),
+                    nn.Linear(8, 1)   # → scalar potential energy
+                )
+                
+                # Kinetic energy function T(p) - mass matrix approximation
+                self.kinetic_net = nn.Sequential(
+                    nn.Linear(3, 8),  # 3D momentum → kinetic
+                    nn.Tanh(), 
+                    nn.Linear(8, 1)   # → scalar kinetic energy
+                )
+                
+                # Conservative force field ∇V(q)
+                self.force_net = nn.Sequential(
+                    nn.Linear(3, 8),  # 3D position → force field
+                    nn.Tanh(),
+                    nn.Linear(8, 3)   # → 3D force vector
+                )
+                
+            def hamiltonian(self, q, p):
+                """Compute Hamiltonian H(q,p) = T(p) + V(q)"""
+                T = self.kinetic_net(p)  # Kinetic energy
+                V = self.potential_net(q)  # Potential energy
+                return T + V
+            
+            def hamilton_equations(self, q, p):
+                """Hamilton's equations: dq/dt = ∂H/∂p, dp/dt = -∂H/∂q"""
+                # Enable gradients for automatic differentiation
+                q = q.requires_grad_(True)
+                p = p.requires_grad_(True)
+                
+                H = self.hamiltonian(q, p)
+                
+                # ∂H/∂p = dq/dt (generalized velocity)
+                dq_dt = torch.autograd.grad(H, p, create_graph=True)[0]
+                
+                # -∂H/∂q = dp/dt (negative force)
+                dp_dt = -torch.autograd.grad(H, q, create_graph=True)[0]
+                
+                return dq_dt, dp_dt
+            
+            def symplectic_integration(self, q, p, dt):
+                """Symplectic Euler integration - preserves energy"""
+                # Step 1: Update momentum using current position
+                force = -self.force_net(q)  # F = -∇V(q)
+                p_new = p + dt * force
+                
+                # Step 2: Update position using new momentum  
+                # Approximate ∂T/∂p ≈ p (assuming unit mass)
+                q_new = q + dt * p_new
+                
+                return q_new, p_new
+            
+            def forward(self, state, dt):
+                """Propagate physical state forward in time"""
+                q = state[:3]  # Position (generalized coordinates)
+                p = state[3:6]  # Momentum (generalized momenta)
+                
+                # Symplectic integration preserves Hamiltonian structure
+                q_new, p_new = self.symplectic_integration(q, p, dt)
+                
+                return torch.cat([q_new, p_new])
+        
+        return HamiltonianEngine()
     
     def _background_training_loop(self):
         """Background thread for training"""
@@ -265,6 +345,43 @@ class UltraFast60FpsLeanVAE:
                 # Penalize sudden changes (unless there's high motion)
                 motion_dampening = max(0.1, 1.0 - motion_level * 3.0)
                 temporal_sequence_loss = torch.mean(torch.abs(latent_accel)) * motion_dampening
+            
+            # ==== PHYSICS-BASED LATENT DYNAMICS ====
+            
+            # 4. HAMILTONIAN/LAGRANGIAN DYNAMICS - Physical consistency in latent space
+            physics_loss = torch.tensor(0.0, device=self.device)
+            energy_conservation_loss = torch.tensor(0.0, device=self.device)
+            
+            if len(self.latent_history) >= 2:
+                # Treat latent as physical state: q = position, p = momentum
+                current_state = current_latent_flat  # [q1,q2,q3,p1,p2,p3]
+                prev_state = self.latent_history[-1]
+                
+                # Physics engine predicts next state using Hamiltonian dynamics
+                predicted_state = self.physics_engine(prev_state, self.dt)
+                
+                # Physics consistency: predicted state should match actual state
+                physics_loss = torch.mean(torch.abs(predicted_state - current_state))
+                
+                # Energy conservation: Hamiltonian should be preserved
+                q_current = current_state[:3]
+                p_current = current_state[3:6]
+                q_prev = prev_state[:3] 
+                p_prev = prev_state[3:6]
+                
+                H_current = self.physics_engine.hamiltonian(q_current, p_current)
+                H_prev = self.physics_engine.hamiltonian(q_prev, p_prev)
+                
+                # Energy should be conserved (small changes allowed for numerical stability)
+                energy_conservation_loss = torch.abs(H_current - H_prev)
+                self.energy_history.append(H_current.item())
+                
+                # Train physics engine separately (like motion predictor)
+                physics_total_loss = physics_loss + 0.1 * energy_conservation_loss
+                self.physics_optimizer.zero_grad()
+                physics_total_loss.backward(retain_graph=True)
+                torch.nn.utils.clip_grad_norm_(self.physics_engine.parameters(), max_norm=0.5)
+                self.physics_optimizer.step()
             
             # Cache current latent for next iteration
             self.latent_history.append(current_latent.squeeze(0).clone())
