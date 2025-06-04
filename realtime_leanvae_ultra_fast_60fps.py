@@ -120,6 +120,11 @@ class UltraFast60FpsLeanVAE:
         self.motion_history = deque(maxlen=10)
         self.loss_history = deque(maxlen=20)
         
+        # Spatiotemporal learning (zero inference overhead)
+        self.latent_history = deque(maxlen=5)  # Cache recent latents for temporal learning
+        self.motion_predictor = self._create_motion_predictor().to(device)  # Tiny MLP for latent prediction
+        self.motion_optimizer = optim.Adam(self.motion_predictor.parameters(), lr=learning_rate * 0.1)
+        
         # Loss function
         self.mse_loss = nn.MSELoss()
         
@@ -154,6 +159,16 @@ class UltraFast60FpsLeanVAE:
         
         model.apply(init_weights)
         return model
+    
+    def _create_motion_predictor(self):
+        """Create tiny MLP for latent motion prediction (zero inference overhead)"""
+        return nn.Sequential(
+            nn.Linear(6, 16),  # 6D latent → 16 hidden
+            nn.LeakyReLU(0.2),
+            nn.Linear(16, 16),
+            nn.LeakyReLU(0.2), 
+            nn.Linear(16, 6)   # → 6D predicted next latent
+        )
     
     def _background_training_loop(self):
         """Background thread for training"""
@@ -206,6 +221,54 @@ class UltraFast60FpsLeanVAE:
             # Forward pass
             reconstructed, mean, logvar = self.inference_model(frame_tensor)
             
+            # Get current latent representation (use mean for deterministic prediction)
+            current_latent = mean.detach()  # Detach to avoid gradients flowing back through predictor
+            
+            # ==== SPATIOTEMPORAL LEARNING (Background Training Only) ====
+            
+            # 1. LATENT MOTION PREDICTION - Learn temporal dynamics in latent space
+            motion_prediction_loss = torch.tensor(0.0, device=self.device)
+            if len(self.latent_history) >= 2:
+                # Predict next latent from previous latent
+                prev_latent = self.latent_history[-1]
+                predicted_latent = self.motion_predictor(prev_latent.unsqueeze(0))
+                motion_prediction_loss = torch.mean(torch.abs(predicted_latent.squeeze(0) - current_latent.squeeze(0)))
+                
+                # Train motion predictor (separate optimization)
+                self.motion_optimizer.zero_grad()
+                motion_prediction_loss.backward(retain_graph=True)
+                self.motion_optimizer.step()
+            
+            # 2. TEMPORAL LATENT DYNAMICS - Structure latent space for motion
+            # Split 6D latent: [3D spatial features, 2D velocity, 1D acceleration]
+            current_latent_flat = current_latent.squeeze(0)  # Ensure 1D tensor
+            spatial_features = current_latent_flat[:3]    # Spatial content
+            velocity_features = current_latent_flat[3:5]  # Motion velocity
+            acceleration_feature = current_latent_flat[5:6]  # Motion acceleration
+            
+            # Motion-conditioned latent consistency
+            motion_consistency_loss = torch.tensor(0.0, device=self.device)
+            if len(self.latent_history) >= 2:
+                prev_velocity = self.latent_history[-1][3:5]  # Previous velocity features
+                # Velocity should correlate with actual motion level
+                velocity_magnitude = torch.norm(velocity_features - prev_velocity).mean()
+                motion_target = torch.tensor(motion_level, device=self.device)
+                motion_consistency_loss = torch.abs(velocity_magnitude - motion_target)
+            
+            # 3. MULTI-FRAME TEMPORAL LEARNING - Learn from sequence patterns
+            temporal_sequence_loss = torch.tensor(0.0, device=self.device)
+            if len(self.latent_history) >= 3:
+                # Encourage smooth temporal transitions in latent space
+                latent_seq = torch.stack([self.latent_history[-2], self.latent_history[-1], current_latent.squeeze(0)])
+                # Compute second-order differences (acceleration in latent space)
+                latent_accel = latent_seq[2] - 2*latent_seq[1] + latent_seq[0]
+                # Penalize sudden changes (unless there's high motion)
+                motion_dampening = max(0.1, 1.0 - motion_level * 3.0)
+                temporal_sequence_loss = torch.mean(torch.abs(latent_accel)) * motion_dampening
+            
+            # Cache current latent for next iteration
+            self.latent_history.append(current_latent.squeeze(0).clone())
+            
             # Base reconstruction loss - L1 preserves colors better than MSE
             recon_loss = torch.mean(torch.abs(reconstructed - frame_tensor))
             
@@ -234,13 +297,18 @@ class UltraFast60FpsLeanVAE:
             kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
             kl_weight = 0.0001 * (1.0 + motion_level)  # Increase KL weight during motion
             
-            # Motion-adaptive total loss
+            # ==== ENHANCED SPATIOTEMPORAL TOTAL LOSS ====
             temporal_weight = 0.3 if temporal_loss > 0 else 0.0
-            total_loss = (recon_loss + 
-                         kl_weight * kl_loss + 
-                         0.5 * saturation_loss + 
-                         0.3 * green_preservation + 
-                         temporal_weight * temporal_loss)
+            
+            total_loss = (recon_loss +                          # Base reconstruction
+                         kl_weight * kl_loss +                  # VAE regularization
+                         0.5 * saturation_loss +                # Color preservation  
+                         0.3 * green_preservation +             # Green channel protection
+                         temporal_weight * temporal_loss +      # Temporal consistency
+                         0.1 * motion_consistency_loss +        # Motion-latent consistency
+                         0.05 * temporal_sequence_loss)         # Smooth latent transitions
+            
+            # Note: motion_prediction_loss is trained separately to avoid interference
             
             # Store loss for monitoring
             self.loss_history.append(total_loss.item())
