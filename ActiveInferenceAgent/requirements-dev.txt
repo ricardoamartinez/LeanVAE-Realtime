@@ -1,0 +1,32 @@
+# Development dependencies
+-r requirements.txt
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=3.0.0
+pytest-xdist>=2.5.0
+hypothesis>=6.0.0
+
+# Code quality
+black>=22.0.0
+flake8>=4.0.0
+mypy>=0.940
+isort>=5.10.0
+
+# Documentation
+sphinx>=4.0.0
+sphinx-rtd-theme>=1.0.0
+sphinx-autodoc-typehints>=1.12.0
+
+# Profiling and debugging
+line_profiler>=3.5.0
+memory_profiler>=0.60.0
+py-spy>=0.3.0
+
+# Notebooks (for experiments)
+jupyter>=1.0.0
+jupyterlab>=3.0.0
+
+# Visualization
+tensorboard>=2.8.0
+wandb>=0.12.0
