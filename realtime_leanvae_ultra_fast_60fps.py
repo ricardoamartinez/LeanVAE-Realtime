@@ -15,44 +15,63 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 class PhysicsInformedWaveletTransform(nn.Module):
-    """Revolutionary physics-informed wavelet transform using pure mathematics - NO CONVOLUTIONS!"""
-    def __init__(self, input_size=240, n_channels=3):
+    """Revolutionary 3D spatiotemporal wavelet transform - Space + Time frequency analysis!"""
+    def __init__(self, input_size=240, n_channels=3, temporal_depth=8):
         super().__init__()
         self.input_size = input_size
         self.n_channels = n_channels
+        self.temporal_depth = temporal_depth
         
-        print(f"🌊 PHYSICS-INFORMED WAVELET TRANSFORM - Pure mathematical wavelet decomposition")
+        print(f"🌊 3D SPATIOTEMPORAL WAVELET TRANSFORM - Space + Time frequency decomposition!")
         
-        # Pre-computed Daubechies-4 wavelet coefficients (physics-based scaling function)
-        h0 = torch.tensor([
+        # Pre-computed Daubechies-4 wavelet coefficients for SPATIAL decomposition
+        spatial_h0 = torch.tensor([
             -0.010597401785, 0.032883011667, 0.030841381836, -0.187034811719,
             -0.027983769417, 0.630880767930, 0.714846570553, 0.230377813309
         ])
         
-        # High-pass filter coefficients (derived from physics of wavelet orthogonality)
-        h1 = torch.tensor([
+        spatial_h1 = torch.tensor([
             -0.230377813309, 0.714846570553, -0.630880767930, -0.027983769417,
             0.187034811719, 0.030841381836, -0.032883011667, -0.010597401785
         ])
         
-        # Create physics-informed convolution-free wavelet matrices
-        # Using direct matrix multiplication for ultra-fast computation
-        self.register_buffer('h0', h0)
-        self.register_buffer('h1', h1)
+        # Haar wavelet coefficients for TEMPORAL decomposition (simpler for motion)
+        temporal_h0 = torch.tensor([0.7071067812, 0.7071067812])  # Normalized Haar low-pass
+        temporal_h1 = torch.tensor([-0.7071067812, 0.7071067812])  # Normalized Haar high-pass
         
-        # Physics-based energy conservation weights for frequency bands
-        self.energy_weights = nn.Parameter(torch.ones(4))  # LL, LH, HL, HH
+        # Register spatial filters
+        self.register_buffer('spatial_h0', spatial_h0)
+        self.register_buffer('spatial_h1', spatial_h1)
+        
+        # Register temporal filters
+        self.register_buffer('temporal_h0', temporal_h0)
+        self.register_buffer('temporal_h1', temporal_h1)
+        
+        # Physics-based energy conservation weights for 8 spatiotemporal frequency bands
+        # LLL, LLH, LHL, LHH, HLL, HLH, HHL, HHH (Low/High in X, Y, Time)
+        self.spatiotemporal_energy_weights = nn.Parameter(torch.ones(8))
+        
+        # Spatial energy weights (for 2D-only processing)
+        self.spatial_energy_weights = nn.Parameter(torch.ones(4))  # LL, LH, HL, HH
         
         # Calculate actual output dimensions for efficient processing
-        self.output_h = input_size // 2  # Wavelet downsampling by 2
-        self.output_w = input_size // 2
-        self.total_features = self.output_h * self.output_w * 4  # 4 frequency bands
+        self.spatial_output_h = input_size // 2  # Spatial wavelet downsampling by 2
+        self.spatial_output_w = input_size // 2
+        self.temporal_output_depth = temporal_depth // 2  # Temporal wavelet downsampling by 2
         
-        print(f"   - Output size: {self.output_h}x{self.output_w} per band")
-        print(f"   - Total features: {self.total_features}")
+        self.spatial_features = self.spatial_output_h * self.spatial_output_w * 4  # 4 spatial bands
+        self.spatiotemporal_features = self.spatial_output_h * self.spatial_output_w * 8 * self.temporal_output_depth  # 8 bands
         
-    def physics_informed_1d_wavelet(self, x, axis):
-        """Ultra-fast 1D wavelet transform using physics-informed vectorized operations"""
+        # Temporal frame buffer for spatiotemporal processing
+        self.frame_buffer = deque(maxlen=temporal_depth)
+        
+        print(f"   - Spatial output: {self.spatial_output_h}x{self.spatial_output_w} per band")
+        print(f"   - Temporal depth: {temporal_depth} → {self.temporal_output_depth}")
+        print(f"   - Spatial features: {self.spatial_features}")
+        print(f"   - Spatiotemporal features: {self.spatiotemporal_features}")
+        
+    def physics_informed_1d_spatial_wavelet(self, x, axis):
+        """Ultra-fast 1D SPATIAL wavelet transform using physics-informed vectorized operations"""
         batch_size, channels, height, width = x.shape
         
         if axis == 3:  # Transform along width (rows)
@@ -62,13 +81,13 @@ class PhysicsInformedWaveletTransform(nn.Module):
             # Transpose and reshape for column-wise processing  
             x_flat = x.permute(0, 1, 3, 2).contiguous().reshape(batch_size * channels * width, height)
         
-        # Apply 1D wavelet convolution using built-in F.conv1d
-        padding = len(self.h0) // 2
+        # Apply 1D spatial wavelet convolution using built-in F.conv1d
+        padding = len(self.spatial_h0) // 2
         x_padded = F.pad(x_flat.unsqueeze(1), (padding, padding), mode='reflect')
         
-        # Apply wavelet filters
-        low_pass = F.conv1d(x_padded, self.h0.reshape(1, 1, -1), stride=2)
-        high_pass = F.conv1d(x_padded, self.h1.reshape(1, 1, -1), stride=2)
+        # Apply spatial wavelet filters
+        low_pass = F.conv1d(x_padded, self.spatial_h0.reshape(1, 1, -1), stride=2)
+        high_pass = F.conv1d(x_padded, self.spatial_h1.reshape(1, 1, -1), stride=2)
         
         # Get output size
         output_size = low_pass.shape[2]
@@ -85,32 +104,126 @@ class PhysicsInformedWaveletTransform(nn.Module):
             result = torch.cat([low_pass, high_pass], dim=3)
             return result.permute(0, 1, 3, 2).contiguous()
     
-    def forward_2d_wavelet(self, x):
-        """Ultra-fast 2D wavelet transform using physics-informed separable decomposition"""
+    def physics_informed_1d_temporal_wavelet(self, x_sequence):
+        """Ultra-fast 1D TEMPORAL wavelet transform across frame sequence"""
+        # x_sequence: (temporal_depth, batch, channels, height, width)
+        temporal_depth, batch_size, channels, height, width = x_sequence.shape
+        
+        # Reshape for temporal processing: (batch*channels*height*width, temporal_depth)
+        x_temporal = x_sequence.permute(1, 2, 3, 4, 0).contiguous()  # (batch, channels, height, width, temporal_depth)
+        x_flat = x_temporal.reshape(batch_size * channels * height * width, temporal_depth)
+        
+        # Apply 1D temporal wavelet convolution
+        padding = len(self.temporal_h0) // 2
+        x_padded = F.pad(x_flat.unsqueeze(1), (padding, padding), mode='reflect')
+        
+        # Apply temporal wavelet filters (Haar for motion detection)
+        temporal_low = F.conv1d(x_padded, self.temporal_h0.reshape(1, 1, -1), stride=2)
+        temporal_high = F.conv1d(x_padded, self.temporal_h1.reshape(1, 1, -1), stride=2)
+        
+        # Get output temporal size
+        temporal_output_size = temporal_low.shape[2]
+        
+        # Reshape back to spatial-temporal format
+        temporal_low = temporal_low.reshape(batch_size, channels, height, width, temporal_output_size)
+        temporal_high = temporal_high.reshape(batch_size, channels, height, width, temporal_output_size)
+        
+        # Convert back to (temporal_output_size, batch, channels, height, width)
+        temporal_low = temporal_low.permute(4, 0, 1, 2, 3)
+        temporal_high = temporal_high.permute(4, 0, 1, 2, 3)
+        
+        return temporal_low, temporal_high, temporal_output_size
+    
+    def forward_2d_spatial_wavelet(self, x):
+        """Ultra-fast 2D SPATIAL wavelet transform using physics-informed separable decomposition"""
         batch_size, channels, height, width = x.shape
         
-        # Row-wise wavelet transform (along width dimension) - vectorized
-        row_transformed = self.physics_informed_1d_wavelet(x, axis=3)
+        # Row-wise spatial wavelet transform (along width dimension) - vectorized
+        row_transformed = self.physics_informed_1d_spatial_wavelet(x, axis=3)
         
-        # Column-wise wavelet transform (along height dimension) - vectorized  
+        # Column-wise spatial wavelet transform (along height dimension) - vectorized  
         # Transpose for column processing
         row_transposed = row_transformed.permute(0, 1, 3, 2)  # (batch, channels, width, height)
-        col_transformed = self.physics_informed_1d_wavelet(row_transposed, axis=3)
+        col_transformed = self.physics_informed_1d_spatial_wavelet(row_transposed, axis=3)
         
         # Transpose back to original format
         result = col_transformed.permute(0, 1, 3, 2)  # (batch, channels, height, width)
         
-        # Split into 4 frequency bands using physics-based energy separation
+        # Split into 4 spatial frequency bands using physics-based energy separation
         h_half, w_half = result.shape[2] // 2, result.shape[3] // 2
         
-        # Extract frequency bands (Low-Low, Low-High, High-Low, High-High)
-        LL = result[:, :, :h_half, :w_half] * self.energy_weights[0]
-        LH = result[:, :, :h_half, w_half:] * self.energy_weights[1]  
-        HL = result[:, :, h_half:, :w_half] * self.energy_weights[2]
-        HH = result[:, :, h_half:, w_half:] * self.energy_weights[3]
+        # Extract spatial frequency bands (Low-Low, Low-High, High-Low, High-High)
+        LL = result[:, :, :h_half, :w_half] * self.spatial_energy_weights[0]
+        LH = result[:, :, :h_half, w_half:] * self.spatial_energy_weights[1]  
+        HL = result[:, :, h_half:, :w_half] * self.spatial_energy_weights[2]
+        HH = result[:, :, h_half:, w_half:] * self.spatial_energy_weights[3]
         
         # Flatten and concatenate for network processing
         return torch.cat([LL.flatten(2), LH.flatten(2), HL.flatten(2), HH.flatten(2)], dim=2)
+    
+    def forward_3d_spatiotemporal_wavelet(self, x_sequence):
+        """🌊 REVOLUTIONARY 3D spatiotemporal wavelet transform - Space + Time decomposition!"""
+        # x_sequence: (temporal_depth, batch, channels, height, width)
+        temporal_depth, batch_size, channels, height, width = x_sequence.shape
+        
+        # Step 1: Temporal decomposition across the frame sequence
+        temporal_low, temporal_high, temporal_output_size = self.physics_informed_1d_temporal_wavelet(x_sequence)
+        
+        # Step 2: Spatial decomposition on both temporal components
+        spatiotemporal_bands = []
+        
+        # Process temporal low-frequency frames (stable motion)
+        for t in range(temporal_output_size):
+            spatial_coeffs = self.forward_2d_spatial_wavelet(temporal_low[t])  # (batch, channels, spatial_features)
+            spatiotemporal_bands.append(spatial_coeffs)
+        
+        # Process temporal high-frequency frames (rapid motion)  
+        for t in range(temporal_output_size):
+            spatial_coeffs = self.forward_2d_spatial_wavelet(temporal_high[t])  # (batch, channels, spatial_features)
+            spatiotemporal_bands.append(spatial_coeffs)
+        
+        # Combine all spatiotemporal frequency bands
+        # Each frame contributes: 4 spatial bands × 2 temporal bands = 8 spatiotemporal bands per frame
+        all_bands = torch.cat(spatiotemporal_bands, dim=2)  # (batch, channels, total_spatiotemporal_features)
+        
+        # Apply physics-based energy weights for spatiotemporal bands
+        band_size = all_bands.shape[2] // 8  # 8 spatiotemporal frequency bands
+        weighted_bands = []
+        
+        for i in range(8):
+            start_idx = i * band_size
+            end_idx = (i + 1) * band_size
+            band = all_bands[:, :, start_idx:end_idx] * self.spatiotemporal_energy_weights[i]
+            weighted_bands.append(band)
+        
+        spatiotemporal_features = torch.cat(weighted_bands, dim=2)
+        
+        return spatiotemporal_features, temporal_output_size
+    
+    def add_frame_to_buffer(self, frame_tensor):
+        """Add frame to temporal buffer for spatiotemporal processing"""
+        self.frame_buffer.append(frame_tensor.detach().clone())
+    
+    def get_spatiotemporal_sequence(self):
+        """Get current frame sequence for spatiotemporal wavelet processing"""
+        if len(self.frame_buffer) < self.temporal_depth:
+            # Pad with repeated frames if not enough frames
+            frames = list(self.frame_buffer)
+            while len(frames) < self.temporal_depth:
+                if len(frames) > 0:
+                    frames.insert(0, frames[0])
+                else:
+                    # Create zero frame if buffer is empty
+                    frames.append(torch.zeros(1, self.n_channels, self.input_size, self.input_size))
+        else:
+            frames = list(self.frame_buffer)
+        
+        # Stack into temporal sequence: (temporal_depth, batch, channels, height, width)
+        return torch.stack(frames, dim=0)
+    
+    def can_process_spatiotemporal(self):
+        """Check if we have enough frames for spatiotemporal processing"""
+        return len(self.frame_buffer) >= self.temporal_depth
     
     def inverse_2d_wavelet(self, coeffs, target_height, target_width):
         """Ultra-fast inverse wavelet transform using physics principles"""
@@ -301,6 +414,163 @@ class FrequencyMotionDetector(nn.Module):
         
         return is_motion.item(), motion_score
 
+class SceneChangeDetector:
+    """🔄 Revolutionary scene change detection for instant memory reset"""
+    def __init__(self, threshold=0.3):
+        self.threshold = threshold
+        self.prev_histogram = None
+        self.scene_change_count = 0
+        
+    def detect_scene_change(self, frame):
+        """Detect major scene changes using histogram comparison"""
+        # Calculate color histogram
+        hist = cv2.calcHist([frame], [0, 1, 2], None, [32, 32, 32], [0, 256, 0, 256, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        
+        if self.prev_histogram is None:
+            self.prev_histogram = hist
+            return False, 0.0
+            
+        # Compare histograms using correlation
+        correlation = cv2.compareHist(self.prev_histogram, hist, cv2.HISTCMP_CORREL)
+        change_score = 1.0 - correlation
+        
+        # Update previous histogram
+        self.prev_histogram = hist
+        
+        # Scene change detected if correlation is low
+        is_scene_change = change_score > self.threshold
+        if is_scene_change:
+            self.scene_change_count += 1
+            print(f"🔄 SCENE CHANGE DETECTED! Score: {change_score:.3f} (Count: {self.scene_change_count})")
+            
+        return is_scene_change, change_score
+
+class CollapseDetector:
+    """🛡️ Revolutionary VAE collapse detection and recovery"""
+    def __init__(self):
+        self.mean_history = deque(maxlen=10)
+        self.std_history = deque(maxlen=10)
+        self.collapse_count = 0
+        
+    def detect_collapse(self, reconstruction, mean, logvar):
+        """Detect VAE posterior collapse"""
+        # Calculate reconstruction statistics
+        recon_mean = torch.mean(reconstruction).item()
+        recon_std = torch.std(reconstruction).item()
+        
+        # Calculate latent statistics
+        latent_mean = torch.mean(torch.abs(mean)).item()
+        latent_std = torch.std(mean).item()
+        
+        # Store history
+        self.mean_history.append(recon_mean)
+        self.std_history.append(recon_std)
+        
+        # Collapse indicators
+        indicators = {
+            'low_reconstruction_std': recon_std < 0.05,  # Too uniform output
+            'extreme_reconstruction_mean': recon_mean < 0.1 or recon_mean > 0.9,  # Too dark/bright
+            'low_latent_diversity': latent_std < 0.01,  # No latent diversity
+            'decreasing_std_trend': len(self.std_history) >= 5 and all(
+                self.std_history[i] > self.std_history[i+1] for i in range(4)
+            )  # Consistently decreasing diversity
+        }
+        
+        # Count active indicators
+        active_indicators = sum(indicators.values())
+        collapse_score = active_indicators / len(indicators)
+        
+        # Collapse detected if multiple indicators are active
+        is_collapsed = active_indicators >= 2
+        
+        if is_collapsed:
+            self.collapse_count += 1
+            print(f"🛡️ VAE COLLAPSE DETECTED! Score: {collapse_score:.3f} Active: {list(indicators.keys())} (Count: {self.collapse_count})")
+            
+        return is_collapsed, collapse_score, indicators
+    
+    def get_recovery_strategy(self, indicators):
+        """Get recovery strategy based on collapse type"""
+        if indicators['low_reconstruction_std']:
+            return "diversity_injection"
+        elif indicators['extreme_reconstruction_mean']:
+            return "range_normalization"
+        elif indicators['low_latent_diversity']:
+            return "latent_noise_injection"
+        else:
+            return "general_reset"
+
+class TemporalMemoryManager:
+    """🧠 Revolutionary temporal memory management with exponential forgetting"""
+    def __init__(self, forget_rate=0.95, burst_forget_rate=0.5):
+        self.forget_rate = forget_rate
+        self.burst_forget_rate = burst_forget_rate
+        self.pattern_memory = deque(maxlen=20)
+        self.static_pattern_count = 0
+        
+    def update_memory(self, frame_features):
+        """Update temporal memory with new frame features"""
+        self.pattern_memory.append(frame_features.detach().clone())
+        
+    def detect_static_patterns(self):
+        """Detect if patterns are becoming too static (OLED burn effect)"""
+        if len(self.pattern_memory) < 10:
+            return False, 0.0
+            
+        # Calculate variance across recent patterns
+        recent_patterns = torch.stack(list(self.pattern_memory)[-10:])
+        temporal_variance = torch.var(recent_patterns, dim=0).mean().item()
+        
+        # Static pattern if variance is very low
+        is_static = temporal_variance < 0.001
+        
+        if is_static:
+            self.static_pattern_count += 1
+            print(f"🧠 STATIC PATTERN DETECTED! Variance: {temporal_variance:.6f} (Count: {self.static_pattern_count})")
+        else:
+            self.static_pattern_count = max(0, self.static_pattern_count - 1)
+            
+        return is_static, temporal_variance
+    
+    def apply_exponential_forgetting(self, model):
+        """Apply exponential forgetting to model parameters"""
+        with torch.no_grad():
+            for param in model.parameters():
+                # Apply exponential decay to parameters
+                param.mul_(self.forget_rate)
+                
+        print(f"🧠 Applied exponential forgetting (rate: {self.forget_rate})")
+    
+    def burst_forget(self, model):
+        """Apply aggressive forgetting for scene changes"""
+        with torch.no_grad():
+            for param in model.parameters():
+                # Apply strong exponential decay
+                param.mul_(self.burst_forget_rate)
+                # Add small amount of noise to break patterns
+                param.add_(torch.randn_like(param) * 0.001)
+                
+        print(f"🧠 Applied BURST FORGETTING (rate: {self.burst_forget_rate})")
+    
+    def reset_temporal_memory(self, model):
+        """Complete reset of temporal memory"""
+        # Clear memory buffers
+        self.pattern_memory.clear()
+        
+        # Reset model temporal buffers
+        if hasattr(model, 'wavelet_transform') and hasattr(model.wavelet_transform, 'frame_buffer'):
+            model.wavelet_transform.frame_buffer.clear()
+            
+        if hasattr(model, 'koopman_operator') and hasattr(model.koopman_operator, 'temporal_buffer'):
+            model.koopman_operator.temporal_buffer.clear()
+            
+        # Reset previous states
+        model.prev_coeffs = None
+        model.prev_latent = None
+        
+        print(f"🧠 COMPLETE TEMPORAL MEMORY RESET")
+
 class MicroLeanVAE(nn.Module):
     """Revolutionary Pure Wavelet VAE with immediate Hamiltonian adaptation - NO CONVOLUTIONS!"""
     def __init__(self, input_size=240, latent_dim=32):
@@ -319,9 +589,10 @@ class MicroLeanVAE(nn.Module):
         # Calculate actual wavelet features by test transform
         test_input = torch.randn(1, 3, input_size, input_size)
         with torch.no_grad():
-            test_coeffs = self.wavelet_transform.forward_2d_wavelet(test_input)
+            test_coeffs = self.wavelet_transform.forward_2d_spatial_wavelet(test_input)
             self.wavelet_features = test_coeffs.shape[2]
             print(f"🌊 Physics-informed wavelet features: {self.wavelet_features} features")
+            print(f"🌊 3D Spatiotemporal wavelet features: {self.wavelet_transform.spatiotemporal_features}")
         
         # Pure linear encoder/decoder (NO convolutions)
         self.encoder = nn.Sequential(
@@ -357,21 +628,53 @@ class MicroLeanVAE(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
         
-    def encode(self, x):
-        # Transform to wavelet domain
-        wavelet_coeffs = self.wavelet_transform.forward_2d_wavelet(x)
+    def encode(self, x, use_spatiotemporal=False):
+        # Add frame to temporal buffer for spatiotemporal processing
+        self.wavelet_transform.add_frame_to_buffer(x)
         
-        # Flatten for linear layers
-        batch_size = wavelet_coeffs.shape[0]
-        flattened = wavelet_coeffs.reshape(batch_size, -1)
+        # Choose processing mode based on temporal buffer availability
+        if use_spatiotemporal and self.wavelet_transform.can_process_spatiotemporal():
+            # 🌊 SPATIOTEMPORAL PROCESSING - Space + Time wavelets!
+            frame_sequence = self.wavelet_transform.get_spatiotemporal_sequence()
+            spatiotemporal_coeffs, temporal_frames = self.wavelet_transform.forward_3d_spatiotemporal_wavelet(frame_sequence)
+            
+            # Use spatiotemporal features
+            batch_size = spatiotemporal_coeffs.shape[0]
+            flattened = spatiotemporal_coeffs.reshape(batch_size, -1)
+            
+            # Detect spatiotemporal motion (more sophisticated)
+            if self.prev_coeffs is not None:
+                # Compare spatiotemporal energy across bands
+                is_motion, motion_score = self.motion_detector(spatiotemporal_coeffs, self.prev_coeffs)
+            else:
+                is_motion, motion_score = False, 0.0
+            
+            self.prev_coeffs = spatiotemporal_coeffs.detach()
+            
+            # Print occasionally for debugging
+            if hasattr(self, '_debug_counter'):
+                self._debug_counter += 1
+            else:
+                self._debug_counter = 0
+                
+            if self._debug_counter % 20 == 0:  # Print occasionally
+                print(f"🌊 Using SPATIOTEMPORAL wavelets: {flattened.shape[1]} features")
+            
+        else:
+            # Standard 2D spatial wavelet processing
+            wavelet_coeffs = self.wavelet_transform.forward_2d_spatial_wavelet(x)
+            
+            # Flatten for linear layers
+            batch_size = wavelet_coeffs.shape[0]
+            flattened = wavelet_coeffs.reshape(batch_size, -1)
+            
+            # Detect frequency domain motion
+            is_motion, motion_score = self.motion_detector(wavelet_coeffs, self.prev_coeffs)
+            self.prev_coeffs = wavelet_coeffs.detach()
         
         # Encode to latent space
         encoded = self.encoder(flattened)
         mean, logvar = torch.chunk(encoded, 2, dim=1)
-        
-        # Detect frequency domain motion
-        is_motion, motion_score = self.motion_detector(wavelet_coeffs, self.prev_coeffs)
-        self.prev_coeffs = wavelet_coeffs.detach()
         
         return mean, logvar
     
@@ -437,29 +740,41 @@ class UltraFast60FpsLeanVAE:
         # Make sure it's divisible by 8 for the conv layers
         self.process_size = (self.process_size // 8) * 8
         
-        print(f"Initializing revolutionary immediate adaptive system for 60 FPS at {self.process_size}x{self.process_size}...")
+        print(f"🚀 REVOLUTIONARY INSTANT ADAPTATION SYSTEM - Anti-Collapse & Ultra-Fast Learning")
+        print(f"Initializing at {self.process_size}x{self.process_size} with instant forgetting mechanisms...")
         
         # Revolutionary immediate adaptive model with frequency domain processing
         self.inference_model = MicroLeanVAE(input_size=self.process_size, latent_dim=32).to(device)
         self.inference_model.eval()
         
-        # Stable but fast optimizers for spatiotemporal learning  
-        self.ultra_fast_optimizer = optim.SGD(self.inference_model.parameters(), lr=learning_rate * 3, momentum=0.9)  # 3x faster but stable
-        self.fast_optimizer = optim.SGD(self.inference_model.parameters(), lr=learning_rate * 2, momentum=0.9)
-        self.adaptive_optimizer = optim.AdamW(self.inference_model.parameters(), lr=learning_rate * 1.5, weight_decay=1e-4)
+        # 🔥 REVOLUTIONARY ULTRA-AGGRESSIVE OPTIMIZERS - 10x faster learning!
+        self.instant_optimizer = optim.SGD(self.inference_model.parameters(), lr=learning_rate * 15, momentum=0.95)  # 15x for instant adaptation
+        self.ultra_fast_optimizer = optim.SGD(self.inference_model.parameters(), lr=learning_rate * 10, momentum=0.9)  # 10x for rapid changes
+        self.fast_optimizer = optim.SGD(self.inference_model.parameters(), lr=learning_rate * 5, momentum=0.9)
+        self.adaptive_optimizer = optim.AdamW(self.inference_model.parameters(), lr=learning_rate * 2, weight_decay=1e-4)
         
         # Spatiotemporal motion detection with optical flow
         self.optical_flow_detector = OpticalFlowMotionDetector()
         self.prev_frame_coeffs = None
         
         # Koopman operator learning rate (separate for immediate dynamics learning)
-        self.koopman_optimizer = optim.AdamW(self.inference_model.koopman_operator.parameters(), lr=learning_rate * 2)
+        self.koopman_optimizer = optim.AdamW(self.inference_model.koopman_operator.parameters(), lr=learning_rate * 5)
         
-        print(f"🔥 STABLE FAST SPATIOTEMPORAL LEARNING ENABLED:")
-        print(f"   - Ultra-Fast SGD: {learning_rate * 3:.6f} (3x base rate)")
-        print(f"   - Fast SGD: {learning_rate * 2:.6f} (2x base rate)")
-        print(f"   - Adaptive AdamW: {learning_rate * 1.5:.6f} (1.5x base rate)")
-        print(f"   - Koopman Learning: {learning_rate * 2:.6f} (2x base rate)")
+        # 🔥 INSTANT FORGETTING & ANTI-COLLAPSE MECHANISMS
+        self.scene_change_detector = SceneChangeDetector()
+        self.collapse_detector = CollapseDetector()
+        self.memory_manager = TemporalMemoryManager()
+        
+        print(f"🔥 REVOLUTIONARY ULTRA-AGGRESSIVE LEARNING ENABLED:")
+        print(f"   - INSTANT Adaptation: {learning_rate * 15:.6f} (15x base rate)")
+        print(f"   - Ultra-Fast SGD: {learning_rate * 10:.6f} (10x base rate)")
+        print(f"   - Fast SGD: {learning_rate * 5:.6f} (5x base rate)")
+        print(f"   - Adaptive AdamW: {learning_rate * 2:.6f} (2x base rate)")
+        print(f"   - Koopman Learning: {learning_rate * 5:.6f} (5x base rate)")
+        print(f"🛡️ ANTI-COLLAPSE PROTECTION:")
+        print(f"   - Scene Change Detection with Memory Reset")
+        print(f"   - VAE Collapse Detection & Recovery")
+        print(f"   - Exponential Pattern Forgetting")
         
         # Threading for immediate adaptation
         self.training_queue = Queue(maxsize=10)
@@ -516,9 +831,12 @@ class UltraFast60FpsLeanVAE:
                 print(f"Training error: {e}")
     
     def _train_step(self, frame_data):
-        """Ultra-aggressive spatiotemporal training for immediate adaptation"""
+        """Ultra-aggressive spatiotemporal training for immediate adaptation with anti-collapse protection"""
         try:
             frame, motion_score = frame_data
+            
+            # 🔄 REVOLUTIONARY SCENE CHANGE DETECTION
+            is_scene_change, scene_change_score = self.scene_change_detector.detect_scene_change(frame)
             
             # Prepare frame for training
             frame_resized = cv2.resize(frame, (self.process_size, self.process_size), interpolation=cv2.INTER_LINEAR)
@@ -527,6 +845,20 @@ class UltraFast60FpsLeanVAE:
             # Convert to tensor
             frame_tensor = torch.tensor(frame_rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
             frame_tensor = frame_tensor.to(self.device)
+            
+            # 🧠 MEMORY MANAGEMENT & PATTERN FORGETTING
+            if is_scene_change:
+                # INSTANT MEMORY RESET for scene changes
+                self.memory_manager.reset_temporal_memory(self.inference_model)
+                self.memory_manager.burst_forget(self.inference_model)
+                print(f"🔄 SCENE CHANGE TRIGGERED INSTANT RESET!")
+            else:
+                # Check for static patterns (OLED burn effect)
+                is_static, static_variance = self.memory_manager.detect_static_patterns()
+                if is_static:
+                    # Apply exponential forgetting to break static patterns
+                    self.memory_manager.apply_exponential_forgetting(self.inference_model)
+                    print(f"🧠 STATIC PATTERN BROKEN with exponential forgetting!")
             
             # Stable motion-based optimizer selection
             if motion_score > 0.2:
@@ -568,10 +900,60 @@ class UltraFast60FpsLeanVAE:
                 # Forward pass
                 reconstructed, mean, logvar = self.inference_model(frame_tensor)
                 
+                # 🛡️ REVOLUTIONARY COLLAPSE DETECTION & RECOVERY
+                is_collapsed, collapse_score, collapse_indicators = self.collapse_detector.detect_collapse(
+                    reconstructed, mean, logvar
+                )
+                
+                if is_collapsed:
+                    # Apply immediate recovery based on collapse type
+                    recovery_strategy = self.collapse_detector.get_recovery_strategy(collapse_indicators)
+                    
+                    if recovery_strategy == "diversity_injection":
+                        # Inject noise to increase diversity
+                        with torch.no_grad():
+                            for param in self.inference_model.decoder.parameters():
+                                param.add_(torch.randn_like(param) * 0.01)
+                        print(f"🛡️ Applied DIVERSITY INJECTION recovery!")
+                        
+                    elif recovery_strategy == "range_normalization":
+                        # Reset decoder bias to normalize output range
+                        with torch.no_grad():
+                            if hasattr(self.inference_model.decoder[-1], 'bias'):
+                                self.inference_model.decoder[-1].bias.zero_()
+                        print(f"🛡️ Applied RANGE NORMALIZATION recovery!")
+                        
+                    elif recovery_strategy == "latent_noise_injection":
+                        # Inject noise to latent space
+                        with torch.no_grad():
+                            for param in self.inference_model.encoder.parameters():
+                                param.add_(torch.randn_like(param) * 0.005)
+                        print(f"🛡️ Applied LATENT NOISE INJECTION recovery!")
+                        
+                    else:
+                        # General reset - apply burst forgetting
+                        self.memory_manager.burst_forget(self.inference_model)
+                        print(f"🛡️ Applied GENERAL RESET recovery!")
+                    
+                    # Use ultra-aggressive learning for recovery
+                    optimizer = self.instant_optimizer
+                    training_steps = 5  # More aggressive recovery
+                    kl_weight = 0.00001  # Minimal regularization during recovery
+                    print(f"🛡️ COLLAPSE RECOVERY MODE - Ultra-aggressive learning!")
+                
                 # Check for NaN in outputs and skip training if found
                 if torch.isnan(reconstructed).any() or torch.isnan(mean).any() or torch.isnan(logvar).any():
-                    print("⚠️ NaN detected in forward pass, skipping training step")
+                    print("⚠️ NaN detected in forward pass, applying emergency reset...")
+                    # Emergency NaN recovery
+                    self.memory_manager.reset_temporal_memory(self.inference_model)
+                    with torch.no_grad():
+                        for param in self.inference_model.parameters():
+                            param.data = torch.where(torch.isnan(param.data), 
+                                                   torch.zeros_like(param.data), param.data)
                     break
+                
+                # 🧠 UPDATE MEMORY PATTERNS
+                self.memory_manager.update_memory(reconstructed.detach())
                 
                 # Core reconstruction loss
                 recon_loss = self.mse_loss(reconstructed, frame_tensor)
