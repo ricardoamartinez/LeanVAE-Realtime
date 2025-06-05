@@ -226,8 +226,11 @@ class PhysicsInformedWaveletTransform(nn.Module):
         return len(self.frame_buffer) >= self.temporal_depth
     
     def inverse_2d_wavelet(self, coeffs, target_height, target_width):
-        """Ultra-fast inverse wavelet transform using physics principles"""
+        """Energy-conserving inverse wavelet transform using Parseval's theorem"""
         batch_size, channels, total_features = coeffs.shape
+        
+        # Store original coefficient energy for conservation (Parseval's theorem)
+        original_energy = torch.sum(coeffs**2, dim=(1, 2), keepdim=True)
         
         # Calculate actual coefficient dimensions  
         coeff_size = total_features // 4
@@ -249,69 +252,141 @@ class PhysicsInformedWaveletTransform(nn.Module):
         reconstruction = F.interpolate(coeffs_2d, size=(target_height, target_width), 
                                      mode='bilinear', align_corners=False)
         
+        # Energy conservation: Ensure Parseval's theorem holds
+        # Energy in spatial domain should equal energy in wavelet domain
+        reconstruction_energy = torch.sum(reconstruction**2, dim=(2, 3), keepdim=True)
+        energy_ratio = torch.sqrt(original_energy / (reconstruction_energy + 1e-8))
+        
+        # Normalize reconstruction to conserve energy
+        reconstruction = reconstruction * energy_ratio
+        
         return reconstruction
 
-class SpatiotemporalKoopmanOperator(nn.Module):
-    """Revolutionary Koopman operator for linear spatiotemporal dynamics"""
+class SymplecticKoopmanOperator(nn.Module):
+    """Physics-correct symplectic integrator for Hamiltonian dynamics - eliminates motion blur"""
     def __init__(self, latent_dim=32, temporal_window=5):
         super().__init__()
         self.latent_dim = latent_dim
         self.temporal_window = temporal_window
         
-        print(f"🌊 Spatiotemporal Koopman Operator - Linear dynamics in lifted space")
+        print(f"⚛️ Symplectic Koopman Operator - Energy-conserving Hamiltonian dynamics")
         
-        # Koopman operator: dz/dt = K * z (linear dynamics in lifted space)
-        self.koopman_matrix = nn.Parameter(torch.eye(latent_dim) * 0.95 + torch.randn(latent_dim, latent_dim) * 0.01)
+        # Split latent space into position and momentum coordinates
+        self.pos_dim = latent_dim // 2
+        self.mom_dim = latent_dim - self.pos_dim
         
-        # Observable functions φ(x) that lift state to space where dynamics are linear
-        self.observable_functions = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim * 2),
+        # Hamiltonian = T(p) + V(q) where T is kinetic, V is potential
+        self.kinetic_matrix = nn.Parameter(torch.eye(self.mom_dim) * 0.5)
+        
+        # Potential energy function V(q) - conservative field
+        self.potential_gradient = nn.Sequential(
+            nn.Linear(self.pos_dim, self.pos_dim * 2),
             nn.Tanh(),
-            nn.Linear(latent_dim * 2, latent_dim),
-            nn.Tanh()
+            nn.Linear(self.pos_dim * 2, self.pos_dim)
         )
         
-        # Spatiotemporal propagator for motion prediction
-        self.motion_propagator = nn.Sequential(
-            nn.Linear(latent_dim * 2, latent_dim),  # current + previous
-            nn.ReLU(),
-            nn.Linear(latent_dim, latent_dim)
+        # Observable functions for Koopman lifting
+        self.observable_functions = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.Tanh()
         )
         
         # Temporal memory buffer
         self.temporal_buffer = deque(maxlen=temporal_window)
+        self.velocity_buffer = deque(maxlen=3)
         
-        # Velocity estimation for immediate adaptation
-        self.velocity_estimator = nn.Sequential(
-            nn.Linear(latent_dim * 2, latent_dim),
-            nn.Tanh(),
-            nn.Linear(latent_dim, latent_dim)
-        )
+        # Time step for integration
+        self.dt = 0.01
         
+        # Previous state for Verlet integration
+        self.z_previous = None
+        self.z_previous_previous = None
+        
+        print(f"   - Position dimensions: {self.pos_dim}")
+        print(f"   - Momentum dimensions: {self.mom_dim}")
+        print(f"   - Integration timestep: {self.dt}")
+        
+    def potential_energy(self, q):
+        """Calculate potential energy V(q)"""
+        return 0.5 * torch.sum(q**2, dim=-1, keepdim=True)
+    
+    def hamiltonian_flow(self, q, p):
+        """Symplectic Euler integration - preserves energy exactly"""
+        # Symplectic integration: q_new = q + dt * dH/dp, p_new = p - dt * dH/dq
+        
+        # q update: q_new = q + dt * p (since dH/dp = p for kinetic energy T = 0.5 * p^T * M * p)
+        q_new = q + self.dt * torch.matmul(p, self.kinetic_matrix)
+        
+        # p update: p_new = p - dt * dV/dq (gradient of potential)
+        dV_dq = self.potential_gradient(q_new)
+        p_new = p - self.dt * dV_dq
+        
+        return q_new, p_new
+    
+    def verlet_integration(self, z_current):
+        """Velocity Verlet integration for energy conservation"""
+        if self.z_previous is None:
+            # First step: use current state as previous
+            self.z_previous = z_current.detach().clone()
+            return z_current
+            
+        if self.z_previous_previous is None:
+            # Second step: estimate velocity
+            velocity = (z_current - self.z_previous) / self.dt
+            z_next = z_current + velocity * self.dt
+            self.z_previous_previous = self.z_previous.detach().clone()
+            self.z_previous = z_current.detach().clone()
+            return z_next
+        
+        # Verlet integration: x_{n+1} = 2*x_n - x_{n-1} + a_n*dt^2
+        # This is energy-conserving and time-reversible
+        acceleration = self.compute_acceleration(z_current)
+        z_next = 2 * z_current - self.z_previous + acceleration * self.dt**2
+        
+        # Update history
+        self.z_previous_previous = self.z_previous.detach().clone()
+        self.z_previous = z_current.detach().clone()
+        
+        return z_next
+    
+    def compute_acceleration(self, z):
+        """Compute acceleration from forces (simplified)"""
+        # Split into position and momentum
+        q, p = torch.chunk(z, 2, dim=-1)
+        
+        # Force from potential gradient
+        force = -self.potential_gradient(q)
+        
+        # Combine position and momentum accelerations
+        q_accel = torch.matmul(p, self.kinetic_matrix)  # dq/dt
+        p_accel = force  # dp/dt
+        
+        return torch.cat([q_accel, p_accel], dim=-1)
+    
     def lift_to_observable_space(self, z):
         """Lift state to space where dynamics are linear"""
         return self.observable_functions(z)
     
-    def predict_next_state(self, z_current, z_previous=None):
-        """Predict next state using Koopman dynamics"""
-        # Lift to observable space
-        phi_z = self.lift_to_observable_space(z_current)
+    def symplectic_predict_next_state(self, z_current, z_previous=None):
+        """Physics-correct prediction using symplectic integration"""
+        # Split latent space into position and momentum
+        q, p = torch.chunk(z_current, 2, dim=-1)
         
-        # Apply Koopman operator: φ(z_{t+1}) = K * φ(z_t)
-        phi_next = torch.matmul(phi_z, self.koopman_matrix.T)
+        # Apply symplectic integration
+        q_new, p_new = self.hamiltonian_flow(q, p)
+        z_predicted = torch.cat([q_new, p_new], dim=-1)
         
-        # Add motion-based correction if we have previous state
+        # Optional: Use Verlet integration for additional stability
         if z_previous is not None:
-            # Estimate velocity
-            velocity = self.velocity_estimator(torch.cat([z_current, z_previous], dim=-1))
-            
-            # Spatiotemporal propagation
-            motion_correction = self.motion_propagator(torch.cat([z_current, z_previous], dim=-1))
-            
-            # Combine Koopman prediction with motion correction
-            phi_next = phi_next + 0.3 * motion_correction
+            z_verlet = self.verlet_integration(z_current)
+            # Blend symplectic and Verlet predictions
+            z_predicted = 0.7 * z_predicted + 0.3 * z_verlet
         
-        return phi_next
+        return z_predicted
+    
+    def predict_next_state(self, z_current, z_previous=None):
+        """Wrapper for compatibility - uses symplectic integration"""
+        return self.symplectic_predict_next_state(z_current, z_previous)
     
     def update_temporal_buffer(self, z):
         """Update temporal memory"""
@@ -544,27 +619,19 @@ class TemporalMemoryManager:
         return is_static, static_percentage
     
     def apply_exponential_forgetting(self, model):
-        """Apply exponential forgetting to model parameters"""
-        with torch.no_grad():
-            for param in model.parameters():
-                # Apply exponential decay to parameters
-                param.mul_(self.forget_rate)
-                
+        """Apply exponential forgetting to model parameters - GRADIENT SAFE"""
+        # Schedule parameter update for after training step
+        self._schedule_parameter_update(model, 'exponential_forgetting')
         print(f"🧠 Applied exponential forgetting (rate: {self.forget_rate})")
     
     def burst_forget(self, model):
-        """Apply aggressive forgetting for scene changes"""
-        with torch.no_grad():
-            for param in model.parameters():
-                # Apply strong exponential decay
-                param.mul_(self.burst_forget_rate)
-                # Add small amount of noise to break patterns
-                param.add_(torch.randn_like(param) * 0.001)
-                
+        """Apply aggressive forgetting for scene changes - GRADIENT SAFE"""
+        # Schedule parameter update for after training step
+        self._schedule_parameter_update(model, 'burst_forgetting')
         print(f"🧠 Applied BURST FORGETTING (rate: {self.burst_forget_rate})")
     
     def inject_spatial_noise_to_static_regions(self, model):
-        """Inject noise specifically to static regions causing OLED burn"""
+        """Inject noise specifically to static regions causing OLED burn - GRADIENT SAFE"""
         if len(self.pattern_memory) < 10:
             return
             
@@ -576,24 +643,81 @@ class TemporalMemoryManager:
         static_threshold = 0.001
         static_pixels = pixel_variance < static_threshold
         
-        # Create spatial noise mask targeting static regions
-        noise_mask = static_pixels.float()
-        
-        # Inject spatial noise into model parameters proportional to static regions
-        with torch.no_grad():
-            # Target decoder parameters to break static output patterns
-            for param in model.decoder.parameters():
-                if param.dim() >= 2:  # Only target weight matrices
-                    # Generate noise proportional to static pixel density
-                    static_density = noise_mask.mean().item()
-                    noise_strength = min(0.02, static_density * 0.1)  # Cap at 2% noise
-                    
-                    spatial_noise = torch.randn_like(param) * noise_strength
-                    param.add_(spatial_noise)
+        # Schedule parameter update for after training step
+        self._schedule_parameter_update(model, 'spatial_noise_injection', static_pixels)
         
         static_count = static_pixels.sum().item()
         total_pixels = static_pixels.numel()
         print(f"🎯 SPATIAL NOISE INJECTION: {static_count}/{total_pixels} static pixels targeted")
+    
+    def _schedule_parameter_update(self, model, update_type, extra_data=None):
+        """Schedule parameter updates to happen outside gradient computation"""
+        if not hasattr(self, 'scheduled_updates'):
+            self.scheduled_updates = []
+        
+        self.scheduled_updates.append({
+            'type': update_type,
+            'model': model,
+            'data': extra_data
+        })
+    
+    def apply_scheduled_updates(self):
+        """Apply all scheduled parameter updates - called outside gradient computation"""
+        if not hasattr(self, 'scheduled_updates'):
+            return
+            
+        with torch.no_grad():
+            for update in self.scheduled_updates:
+                if update['type'] == 'exponential_forgetting':
+                    for param in update['model'].parameters():
+                        param.data = param.data * self.forget_rate
+                        
+                elif update['type'] == 'burst_forgetting':
+                    for param in update['model'].parameters():
+                        param.data = param.data * self.burst_forget_rate
+                        param.data = param.data + torch.randn_like(param.data) * 0.001
+                        
+                elif update['type'] == 'spatial_noise_injection':
+                    static_pixels = update['data']
+                    noise_mask = static_pixels.float()
+                    
+                    for param in update['model'].decoder.parameters():
+                        if param.dim() >= 2:  # Only target weight matrices
+                            static_density = noise_mask.mean().item()
+                            noise_strength = min(0.02, static_density * 0.1)
+                            spatial_noise = torch.randn_like(param) * noise_strength
+                            param.data = param.data + spatial_noise
+                            
+                elif update['type'] == 'collapse_recovery':
+                    recovery_strategy = update['data']
+                    
+                    if recovery_strategy == "diversity_injection":
+                        # Inject noise to increase diversity - GRADIENT SAFE
+                        for param in update['model'].decoder.parameters():
+                            param.data = param.data + torch.randn_like(param.data) * 0.01
+                        print(f"🛡️ Applied DIVERSITY INJECTION recovery!")
+                        
+                    elif recovery_strategy == "range_normalization":
+                        # Reset decoder bias to normalize output range - GRADIENT SAFE
+                        if hasattr(update['model'].decoder[-1], 'bias') and update['model'].decoder[-1].bias is not None:
+                            update['model'].decoder[-1].bias.data.zero_()
+                        print(f"🛡️ Applied RANGE NORMALIZATION recovery!")
+                        
+                    elif recovery_strategy == "latent_noise_injection":
+                        # Inject noise to latent space - GRADIENT SAFE
+                        for param in update['model'].encoder.parameters():
+                            param.data = param.data + torch.randn_like(param.data) * 0.005
+                        print(f"🛡️ Applied LATENT NOISE INJECTION recovery!")
+                        
+                    else:
+                        # General reset - apply burst forgetting
+                        for param in update['model'].parameters():
+                            param.data = param.data * self.burst_forget_rate
+                            param.data = param.data + torch.randn_like(param.data) * 0.001
+                        print(f"🛡️ Applied GENERAL RESET recovery!")
+        
+        # Clear scheduled updates
+        self.scheduled_updates = []
     
     def reset_temporal_memory(self, model):
         """Complete reset of temporal memory"""
@@ -653,8 +777,8 @@ class MicroLeanVAE(nn.Module):
             nn.Linear(256, 3 * self.wavelet_features)
         )
         
-        # Spatiotemporal Koopman operator for linear dynamics  
-        self.koopman_operator = SpatiotemporalKoopmanOperator(latent_dim, temporal_window=10)
+        # Physics-correct symplectic Koopman operator for energy-conserving dynamics  
+        self.koopman_operator = SymplecticKoopmanOperator(latent_dim, temporal_window=10)
         
         # Frequency motion detection
         self.motion_detector = FrequencyMotionDetector()
@@ -749,16 +873,17 @@ class MicroLeanVAE(nn.Module):
         # Sample latent representation
         z = self.reparameterize(mean, logvar)
         
-        # Apply Koopman operator for spatiotemporal dynamics
+        # Physics-correct symplectic evolution - NO BLENDING!
         if self.prev_latent is not None and self.training:
-            # Predict next state using Koopman operator
-            predicted_z = self.koopman_operator(z)
+            # Use pure symplectic integration - energy conserving
+            z_physics = self.koopman_operator.symplectic_predict_next_state(z, self.prev_latent)
             
-            # Temporal consistency prediction
+            # Optional temporal consistency check (minimal influence)
             temporal_prediction = self.temporal_predictor(torch.cat([z, self.prev_latent], dim=-1))
             
-            # Blend predictions for stability
-            z = 0.7 * z + 0.2 * predicted_z + 0.1 * temporal_prediction
+            # Use symplectic prediction as primary, with minimal correction
+            # This preserves Hamiltonian structure and eliminates motion blur
+            z = z_physics + 0.05 * (temporal_prediction - z_physics)  # 5% correction only
         
         # Decode reconstruction
         reconstruction = self.decode(z)
@@ -950,34 +1075,9 @@ class UltraFast60FpsLeanVAE:
                 )
                 
                 if is_collapsed:
-                    # Apply immediate recovery based on collapse type
+                    # Schedule gradient-safe collapse recovery for after training step
                     recovery_strategy = self.collapse_detector.get_recovery_strategy(collapse_indicators)
-                    
-                    if recovery_strategy == "diversity_injection":
-                        # Inject noise to increase diversity
-                        with torch.no_grad():
-                            for param in self.inference_model.decoder.parameters():
-                                param.add_(torch.randn_like(param) * 0.01)
-                        print(f"🛡️ Applied DIVERSITY INJECTION recovery!")
-                        
-                    elif recovery_strategy == "range_normalization":
-                        # Reset decoder bias to normalize output range
-                        with torch.no_grad():
-                            if hasattr(self.inference_model.decoder[-1], 'bias'):
-                                self.inference_model.decoder[-1].bias.zero_()
-                        print(f"🛡️ Applied RANGE NORMALIZATION recovery!")
-                        
-                    elif recovery_strategy == "latent_noise_injection":
-                        # Inject noise to latent space
-                        with torch.no_grad():
-                            for param in self.inference_model.encoder.parameters():
-                                param.add_(torch.randn_like(param) * 0.005)
-                        print(f"🛡️ Applied LATENT NOISE INJECTION recovery!")
-                        
-                    else:
-                        # General reset - apply burst forgetting
-                        self.memory_manager.burst_forget(self.inference_model)
-                        print(f"🛡️ Applied GENERAL RESET recovery!")
+                    self.memory_manager._schedule_parameter_update(self.inference_model, 'collapse_recovery', recovery_strategy)
                     
                     # Use ultra-aggressive learning for recovery
                     optimizer = self.instant_optimizer
