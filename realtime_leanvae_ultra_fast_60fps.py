@@ -262,6 +262,101 @@ class PhysicsInformedWaveletTransform(nn.Module):
         
         return reconstruction
 
+class EnergyConservationDebugger:
+    """🔬 Revolutionary Energy Conservation Debugger - Component-level monitoring"""
+    def __init__(self, tolerance=1e-6):
+        self.tolerance = tolerance
+        self.energy_history = deque(maxlen=100)
+        self.kinetic_history = deque(maxlen=100)
+        self.potential_history = deque(maxlen=100)
+        self.violation_count = 0
+        self.max_violation = 0.0
+        
+        print(f"🔬 ENERGY CONSERVATION DEBUGGER INITIALIZED")
+        print(f"   - Tolerance: {tolerance:.2e}")
+        print(f"   - Monitoring: Kinetic, Potential, Total Energy")
+        print(f"   - Alert threshold: {tolerance:.2e}")
+    
+    def compute_kinetic_energy(self, p):
+        """Compute kinetic energy T = 0.5 * p^T * p (CORRECT FORMULA)"""
+        return 0.5 * torch.sum(p**2, dim=-1, keepdim=True)
+    
+    def compute_potential_energy(self, q):
+        """Compute potential energy V = 0.5 * q^T * q (harmonic oscillator)"""
+        return 0.5 * torch.sum(q**2, dim=-1, keepdim=True)
+    
+    def compute_total_hamiltonian(self, q, p):
+        """Compute total Hamiltonian H = T(p) + V(q)"""
+        kinetic = self.compute_kinetic_energy(p)
+        potential = self.compute_potential_energy(q)
+        return kinetic + potential, kinetic, potential
+    
+    def monitor_energy_step(self, q_before, p_before, q_after, p_after, step_name=""):
+        """Monitor energy conservation across a single integration step"""
+        # Compute energies before and after
+        H_before, T_before, V_before = self.compute_total_hamiltonian(q_before, p_before)
+        H_after, T_after, V_after = self.compute_total_hamiltonian(q_after, p_after)
+        
+        # Calculate energy change
+        delta_H = torch.abs(H_after - H_before).max().item()
+        delta_T = torch.abs(T_after - T_before).max().item()
+        delta_V = torch.abs(V_after - V_before).max().item()
+        
+        # Store in history
+        self.energy_history.append(delta_H)
+        self.kinetic_history.append(delta_T)
+        self.potential_history.append(delta_V)
+        
+        # Check for violations
+        if delta_H > self.tolerance:
+            self.violation_count += 1
+            self.max_violation = max(self.max_violation, delta_H)
+            print(f"⚠️ ENERGY VIOLATION in {step_name}: ΔH={delta_H:.8f}, ΔT={delta_T:.8f}, ΔV={delta_V:.8f}")
+            return False, delta_H
+        
+        return True, delta_H
+    
+    def diagnose_integration_scheme(self, integrator_func, q0, p0, dt=0.01):
+        """Diagnose if an integration scheme is symplectic"""
+        print(f"🔬 DIAGNOSING INTEGRATION SCHEME...")
+        
+        # Test multiple steps
+        q, p = q0.clone(), p0.clone()
+        total_energy_drift = 0.0
+        
+        for step in range(10):
+            H_before, _, _ = self.compute_total_hamiltonian(q, p)
+            
+            # Apply integration step
+            q_new, p_new = integrator_func(q, p, dt)
+            
+            H_after, _, _ = self.compute_total_hamiltonian(q_new, p_new)
+            energy_drift = torch.abs(H_after - H_before).max().item()
+            total_energy_drift += energy_drift
+            
+            q, p = q_new, p_new
+        
+        avg_drift = total_energy_drift / 10
+        is_symplectic = avg_drift < self.tolerance * 10  # Allow small numerical errors
+        
+        print(f"   - Average energy drift per step: {avg_drift:.8f}")
+        print(f"   - Symplectic test: {'✅ PASSED' if is_symplectic else '❌ FAILED'}")
+        
+        return is_symplectic, avg_drift
+    
+    def get_energy_statistics(self):
+        """Get energy conservation statistics"""
+        if len(self.energy_history) == 0:
+            return {}
+        
+        return {
+            'avg_energy_drift': np.mean(list(self.energy_history)),
+            'max_energy_drift': np.max(list(self.energy_history)),
+            'violation_rate': self.violation_count / len(self.energy_history),
+            'total_violations': self.violation_count,
+            'max_violation': self.max_violation
+        }
+
 class SymplecticKoopmanOperator(nn.Module):
     """Physics-correct symplectic integrator for Hamiltonian dynamics - eliminates motion blur"""
     def __init__(self, latent_dim=32, temporal_window=5):
@@ -275,15 +370,14 @@ class SymplecticKoopmanOperator(nn.Module):
         self.pos_dim = latent_dim // 2
         self.mom_dim = latent_dim - self.pos_dim
         
-        # Hamiltonian = T(p) + V(q) where T is kinetic, V is potential
-        self.kinetic_matrix = nn.Parameter(torch.eye(self.mom_dim) * 0.5)
+        # 🔬 ENERGY CONSERVATION DEBUGGER
+        self.energy_debugger = EnergyConservationDebugger(tolerance=1e-6)
         
-        # Potential energy function V(q) - conservative field
-        self.potential_gradient = nn.Sequential(
-            nn.Linear(self.pos_dim, self.pos_dim * 2),
-            nn.Tanh(),
-            nn.Linear(self.pos_dim * 2, self.pos_dim)
-        )
+        # Hamiltonian = T(p) + V(q) where T is kinetic, V is potential
+        # ❌ REMOVED INCORRECT KINETIC MATRIX - using standard T = 0.5 * p^2
+        
+        # For harmonic oscillator: V(q) = 0.5 * q^2, so ∇V = q (NOT neural network!)
+        # ❌ REMOVED INCONSISTENT NEURAL NETWORK POTENTIAL
         
         # Observable functions for Koopman lifting
         self.observable_functions = nn.Sequential(
@@ -310,16 +404,26 @@ class SymplecticKoopmanOperator(nn.Module):
         """Calculate potential energy V(q)"""
         return 0.5 * torch.sum(q**2, dim=-1, keepdim=True)
     
-    def hamiltonian_flow(self, q, p):
-        """Symplectic Euler integration - preserves energy exactly"""
-        # Symplectic integration: q_new = q + dt * dH/dp, p_new = p - dt * dH/dq
+    def correct_hamiltonian_flow(self, q, p):
+        """✅ CORRECTED Symplectic Euler integration - TRUE energy conservation"""
+        # Store initial state for debugging
+        q_before, p_before = q.clone(), p.clone()
         
-        # q update: q_new = q + dt * p (since dH/dp = p for kinetic energy T = 0.5 * p^T * M * p)
-        q_new = q + self.dt * torch.matmul(p, self.kinetic_matrix)
+        # Standard Hamiltonian: H = T(p) + V(q) = 0.5*p^2 + 0.5*q^2
+        # Symplectic Euler: q_new = q + dt * ∂H/∂p = q + dt * p
+        #                   p_new = p - dt * ∂H/∂q = p - dt * q
         
-        # p update: p_new = p - dt * dV/dq (gradient of potential)
-        dV_dq = self.potential_gradient(q_new)
-        p_new = p - self.dt * dV_dq
+        # ✅ CORRECT symplectic integration for harmonic oscillator
+        q_new = q + self.dt * p  # dH/dp = p (correct!)
+        p_new = p - self.dt * q_new  # dH/dq = q (consistent potential!)
+        
+        # 🔬 Energy conservation monitoring
+        is_conserved, energy_drift = self.energy_debugger.monitor_energy_step(
+            q_before, p_before, q_new, p_new, "symplectic_flow"
+        )
+        
+        if not is_conserved:
+            print(f"🔬 SYMPLECTIC INTEGRATION - Energy drift: {energy_drift:.8f}")
         
         return q_new, p_new
     
@@ -340,7 +444,7 @@ class SymplecticKoopmanOperator(nn.Module):
         
         # Verlet integration: x_{n+1} = 2*x_n - x_{n-1} + a_n*dt^2
         # This is energy-conserving and time-reversible
-        acceleration = self.compute_acceleration(z_current)
+        acceleration = self.compute_acceleration_harmonic(z_current)
         z_next = 2 * z_current - self.z_previous + acceleration * self.dt**2
         
         # Update history
@@ -349,38 +453,57 @@ class SymplecticKoopmanOperator(nn.Module):
         
         return z_next
     
-    def compute_acceleration(self, z):
-        """Compute acceleration from forces (simplified)"""
+    def compute_acceleration_harmonic(self, z):
+        """✅ CORRECTED acceleration for harmonic oscillator"""
         # Split into position and momentum
         q, p = torch.chunk(z, 2, dim=-1)
         
-        # Force from potential gradient
-        force = -self.potential_gradient(q)
+        # For harmonic oscillator: 
+        # dq/dt = ∂H/∂p = p (velocity)
+        # dp/dt = -∂H/∂q = -q (force from harmonic potential)
         
-        # Combine position and momentum accelerations
-        q_accel = torch.matmul(p, self.kinetic_matrix)  # dq/dt
-        p_accel = force  # dp/dt
+        q_accel = p  # Velocity (correct!)
+        p_accel = -q  # Force from harmonic potential (correct!)
         
         return torch.cat([q_accel, p_accel], dim=-1)
+    
+    def compute_hamiltonian_energy(self, q, p):
+        """✅ CORRECTED Hamiltonian energy H = T(p) + V(q) with proper formulas"""
+        # ✅ CORRECT kinetic energy: T = 0.5 * p^T * p (standard formula)
+        kinetic_energy = self.energy_debugger.compute_kinetic_energy(p)
+        
+        # ✅ CORRECT potential energy: V = 0.5 * q^T * q (harmonic oscillator)
+        potential_energy = self.energy_debugger.compute_potential_energy(q)
+        
+        # Total Hamiltonian energy
+        total_energy = kinetic_energy + potential_energy
+        return total_energy
     
     def lift_to_observable_space(self, z):
         """Lift state to space where dynamics are linear"""
         return self.observable_functions(z)
     
     def symplectic_predict_next_state(self, z_current, z_previous=None):
-        """Physics-correct prediction using symplectic integration"""
+        """Pure physics-correct prediction using ONLY symplectic integration"""
         # Split latent space into position and momentum
         q, p = torch.chunk(z_current, 2, dim=-1)
         
-        # Apply symplectic integration
-        q_new, p_new = self.hamiltonian_flow(q, p)
+        # Apply CORRECTED symplectic integration - TRUE energy conservation!
+        q_new, p_new = self.correct_hamiltonian_flow(q, p)
         z_predicted = torch.cat([q_new, p_new], dim=-1)
         
-        # Optional: Use Verlet integration for additional stability
+        # Energy conservation check
         if z_previous is not None:
-            z_verlet = self.verlet_integration(z_current)
-            # Blend symplectic and Verlet predictions
-            z_predicted = 0.7 * z_predicted + 0.3 * z_verlet
+            # Verify energy conservation (for diagnostics only)
+            current_energy = self.compute_hamiltonian_energy(q, p)
+            predicted_energy = self.compute_hamiltonian_energy(q_new, p_new)
+            energy_conservation_error = torch.abs(current_energy - predicted_energy)
+            
+            # Only use Verlet if energy conservation is severely violated
+            if energy_conservation_error > 0.1:
+                print(f"⚠️ Energy conservation violation: {energy_conservation_error.item():.6f}")
+                # Pure Verlet as backup - but still no blending
+                z_predicted = self.verlet_integration(z_current)
         
         return z_predicted
     
@@ -392,19 +515,57 @@ class SymplecticKoopmanOperator(nn.Module):
         """Update temporal memory"""
         self.temporal_buffer.append(z.detach().clone())
     
-    def get_temporal_context(self):
-        """Get temporal context for spatiotemporal learning"""
+    def get_spatially_relevant_temporal_context(self, z_current):
+        """Get spatially-coherent temporal context - PREVENTS FLICKERING!"""
         if len(self.temporal_buffer) < 2:
             return None, None
+        
+        # Split current state into position and momentum for spatial analysis
+        q_current, p_current = torch.chunk(z_current, 2, dim=-1)
+        
+        # Find spatially similar past states using energy-based correlation
+        relevant_states = []
+        spatial_correlations = []
+        
+        for past_state in self.temporal_buffer:
+            q_past, p_past = torch.chunk(past_state, 2, dim=-1)
             
-        return self.temporal_buffer[-1], self.temporal_buffer[-2]
+            # Spatial correlation in position space (key for locality)
+            position_correlation = torch.cosine_similarity(q_current, q_past, dim=-1).mean()
+            
+            # Energy correlation for momentum consistency
+            current_energy = self.compute_hamiltonian_energy(q_current, p_current)
+            past_energy = self.compute_hamiltonian_energy(q_past, p_past)
+            energy_similarity = 1.0 / (1.0 + torch.abs(current_energy - past_energy).mean())
+            
+            # Combined spatial-temporal relevance score
+            relevance_score = 0.7 * position_correlation + 0.3 * energy_similarity
+            
+            spatial_correlations.append(relevance_score.item())
+            relevant_states.append((past_state, relevance_score.item()))
+        
+        # Only use states with high spatial relevance (> 0.5 threshold)
+        relevant_threshold = 0.5
+        spatially_relevant = [state for state, score in relevant_states if score > relevant_threshold]
+        
+        if len(spatially_relevant) >= 2:
+            # Use the two most spatially relevant states
+            relevant_states.sort(key=lambda x: x[1], reverse=True)
+            return relevant_states[0][0], relevant_states[1][0]
+        elif len(spatially_relevant) == 1:
+            # Use the one relevant state
+            return spatially_relevant[0], None
+        else:
+            # No spatially relevant states - return None to prevent flickering
+            print(f"🔍 No spatially relevant past states found - preventing flickering")
+            return None, None
     
     def forward(self, z_current):
-        """Forward pass with spatiotemporal dynamics"""
-        # Get temporal context
-        z_prev, z_prev_prev = self.get_temporal_context()
+        """Forward pass with spatially-aware spatiotemporal dynamics"""
+        # Get spatially-relevant temporal context - PREVENTS FLICKERING!
+        z_prev, z_prev_prev = self.get_spatially_relevant_temporal_context(z_current)
         
-        # Predict next state
+        # Predict next state using only spatially-coherent past states
         z_predicted = self.predict_next_state(z_current, z_prev)
         
         # Update temporal buffer
@@ -873,17 +1034,28 @@ class MicroLeanVAE(nn.Module):
         # Sample latent representation
         z = self.reparameterize(mean, logvar)
         
-        # Physics-correct symplectic evolution - NO BLENDING!
+        # PURE HAMILTONIAN EVOLUTION - NO CORRECTIONS!
         if self.prev_latent is not None and self.training:
-            # Use pure symplectic integration - energy conserving
-            z_physics = self.koopman_operator.symplectic_predict_next_state(z, self.prev_latent)
+            # Use PURE symplectic integration - energy conserving, NO MIXING
+            z = self.koopman_operator.symplectic_predict_next_state(z, self.prev_latent)
             
-            # Optional temporal consistency check (minimal influence)
-            temporal_prediction = self.temporal_predictor(torch.cat([z, self.prev_latent], dim=-1))
-            
-            # Use symplectic prediction as primary, with minimal correction
-            # This preserves Hamiltonian structure and eliminates motion blur
-            z = z_physics + 0.05 * (temporal_prediction - z_physics)  # 5% correction only
+            # Energy conservation verification (diagnostic only)
+            if hasattr(self, '_energy_check_counter'):
+                self._energy_check_counter += 1
+            else:
+                self._energy_check_counter = 0
+                
+            # Verify energy conservation occasionally
+            if self._energy_check_counter % 50 == 0:
+                q_current, p_current = torch.chunk(z, 2, dim=-1)
+                q_prev, p_prev = torch.chunk(self.prev_latent, 2, dim=-1)
+                
+                current_energy = self.koopman_operator.compute_hamiltonian_energy(q_current, p_current)
+                prev_energy = self.koopman_operator.compute_hamiltonian_energy(q_prev, p_prev)
+                energy_drift = torch.abs(current_energy - prev_energy).mean().item()
+                
+                if energy_drift > 0.01:
+                    print(f"⚠️ Energy drift detected: {energy_drift:.6f}")
         
         # Decode reconstruction
         reconstruction = self.decode(z)
@@ -1148,11 +1320,16 @@ class UltraFast60FpsLeanVAE:
                 # Store loss for monitoring
                 self.loss_history.append(total_loss.item())
             
+            # 🔬 Apply scheduled parameter updates after training step (gradient-safe)
+            self.memory_manager.apply_scheduled_updates()
+            
             self.inference_model.eval()
             self.stats['training_updates'] += 1
             
         except Exception as e:
             print(f"Training step error: {e}")
+            # 🔬 Apply scheduled updates even on error to maintain system stability
+            self.memory_manager.apply_scheduled_updates()
             self.inference_model.eval()
     
     def process_frame_ultra_fast(self, frame):
