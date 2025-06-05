@@ -514,24 +514,34 @@ class TemporalMemoryManager:
         self.pattern_memory.append(frame_features.detach().clone())
         
     def detect_static_patterns(self):
-        """Detect if patterns are becoming too static (OLED burn effect)"""
+        """Detect PIXEL-LEVEL static patterns (OLED burn effect)"""
         if len(self.pattern_memory) < 10:
             return False, 0.0
             
         # Calculate variance across recent patterns
         recent_patterns = torch.stack(list(self.pattern_memory)[-10:])
-        temporal_variance = torch.var(recent_patterns, dim=0).mean().item()
+        pixel_variance = torch.var(recent_patterns, dim=0)  # Per-pixel variance, don't take mean!
         
-        # Static pattern if variance is very low
-        is_static = temporal_variance < 0.001
+        # Detect static pixels (variance below threshold)
+        static_threshold = 0.001
+        static_pixels = pixel_variance < static_threshold
+        
+        # Calculate percentage of static pixels
+        total_pixels = pixel_variance.numel()
+        static_pixel_count = static_pixels.sum().item()
+        static_percentage = static_pixel_count / total_pixels
+        
+        # OLED burn risk if too many pixels are static
+        burn_risk_threshold = 0.15  # 15% of pixels static = burn risk
+        is_static = static_percentage > burn_risk_threshold
         
         if is_static:
             self.static_pattern_count += 1
-            print(f"🧠 STATIC PATTERN DETECTED! Variance: {temporal_variance:.6f} (Count: {self.static_pattern_count})")
+            print(f"🧠 PIXEL-LEVEL BURN RISK! Static pixels: {static_pixel_count}/{total_pixels} ({static_percentage*100:.1f}%) (Count: {self.static_pattern_count})")
         else:
             self.static_pattern_count = max(0, self.static_pattern_count - 1)
             
-        return is_static, temporal_variance
+        return is_static, static_percentage
     
     def apply_exponential_forgetting(self, model):
         """Apply exponential forgetting to model parameters"""
@@ -552,6 +562,38 @@ class TemporalMemoryManager:
                 param.add_(torch.randn_like(param) * 0.001)
                 
         print(f"🧠 Applied BURST FORGETTING (rate: {self.burst_forget_rate})")
+    
+    def inject_spatial_noise_to_static_regions(self, model):
+        """Inject noise specifically to static regions causing OLED burn"""
+        if len(self.pattern_memory) < 10:
+            return
+            
+        # Calculate per-pixel variance to find static regions
+        recent_patterns = torch.stack(list(self.pattern_memory)[-10:])
+        pixel_variance = torch.var(recent_patterns, dim=0)  # Per-pixel variance
+        
+        # Find static pixels (those with low variance)
+        static_threshold = 0.001
+        static_pixels = pixel_variance < static_threshold
+        
+        # Create spatial noise mask targeting static regions
+        noise_mask = static_pixels.float()
+        
+        # Inject spatial noise into model parameters proportional to static regions
+        with torch.no_grad():
+            # Target decoder parameters to break static output patterns
+            for param in model.decoder.parameters():
+                if param.dim() >= 2:  # Only target weight matrices
+                    # Generate noise proportional to static pixel density
+                    static_density = noise_mask.mean().item()
+                    noise_strength = min(0.02, static_density * 0.1)  # Cap at 2% noise
+                    
+                    spatial_noise = torch.randn_like(param) * noise_strength
+                    param.add_(spatial_noise)
+        
+        static_count = static_pixels.sum().item()
+        total_pixels = static_pixels.numel()
+        print(f"🎯 SPATIAL NOISE INJECTION: {static_count}/{total_pixels} static pixels targeted")
     
     def reset_temporal_memory(self, model):
         """Complete reset of temporal memory"""
@@ -856,9 +898,11 @@ class UltraFast60FpsLeanVAE:
                 # Check for static patterns (OLED burn effect)
                 is_static, static_variance = self.memory_manager.detect_static_patterns()
                 if is_static:
-                    # Apply exponential forgetting to break static patterns
+                    # Apply TARGETED spatial noise injection to break static patterns
+                    self.memory_manager.inject_spatial_noise_to_static_regions(self.inference_model)
+                    # Also apply exponential forgetting for additional protection
                     self.memory_manager.apply_exponential_forgetting(self.inference_model)
-                    print(f"🧠 STATIC PATTERN BROKEN with exponential forgetting!")
+                    print(f"🎯 STATIC PATTERN BROKEN with SPATIAL NOISE + exponential forgetting!")
             
             # Stable motion-based optimizer selection
             if motion_score > 0.2:
